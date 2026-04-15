@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 # Version information
 __version__ = "2.0.0"
 
+# Retry configuration
+_MAX_RETRIES = 3
+_RETRY_BASE_DELAY = 1.0  # seconds (doubled on each attempt: 1s, 2s, 4s)
+_RETRYABLE_STATUSES = {500, 502, 503, 504}
+
 
 class OpenProjectClient:
     """Client for the OpenProject API v3 with optional proxy support"""
@@ -59,7 +64,10 @@ class OpenProjectClient:
         self, method: str, endpoint: str, data: Optional[Dict] = None
     ) -> Dict:
         """
-        Execute an API request.
+        Execute an API request with exponential backoff retry.
+
+        Retries automatically on transient server errors (500, 502, 503, 504)
+        and network failures. Non-retryable errors (4xx) are raised immediately.
 
         Args:
             method: HTTP method (GET, POST, etc.)
@@ -70,7 +78,7 @@ class OpenProjectClient:
             Dict: Response data from the API
 
         Raises:
-            Exception: If the request fails
+            Exception: If the request fails after all retry attempts
         """
         url = f"{self.base_url}/api/v3{endpoint}"
 
@@ -78,53 +86,75 @@ class OpenProjectClient:
         if data:
             logger.debug(f"Request body: {json.dumps(data, indent=2)}")
 
-        # Configure SSL and timeout
-        ssl_context = ssl.create_default_context()
-        connector = aiohttp.TCPConnector(ssl=ssl_context)
-        timeout = aiohttp.ClientTimeout(total=30)
+        last_exc: Optional[Exception] = None
 
-        async with aiohttp.ClientSession(
-            connector=connector, timeout=timeout
-        ) as session:
-            try:
-                # Build request parameters
-                request_params = {
-                    "method": method,
-                    "url": url,
-                    "headers": self.headers,
-                    "json": data,
-                }
+        for attempt in range(_MAX_RETRIES + 1):
+            if attempt > 0:
+                delay = _RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    f"Retry {attempt}/{_MAX_RETRIES} for {method} {url} in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
 
-                # Add proxy if configured
-                if self.proxy:
-                    request_params["proxy"] = self.proxy
+            ssl_context = ssl.create_default_context()
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            timeout = aiohttp.ClientTimeout(total=30)
 
-                async with session.request(**request_params) as response:
-                    response_text = await response.text()
+            async with aiohttp.ClientSession(
+                connector=connector, timeout=timeout
+            ) as session:
+                try:
+                    request_params = {
+                        "method": method,
+                        "url": url,
+                        "headers": self.headers,
+                        "json": data,
+                    }
 
-                    logger.debug(f"Response status: {response.status}")
+                    if self.proxy:
+                        request_params["proxy"] = self.proxy
 
-                    # Parse response
-                    try:
-                        response_json = (
-                            json.loads(response_text) if response_text else {}
-                        )
-                    except json.JSONDecodeError:
-                        logger.error(f"Invalid JSON response: {response_text[:200]}...")
-                        response_json = {}
+                    async with session.request(**request_params) as response:
+                        response_text = await response.text()
 
-                    # Handle errors
-                    if response.status >= 400:
-                        error_msg = self._format_error_message(
-                            response.status, response_text
-                        )
-                        raise Exception(error_msg)
+                        logger.debug(f"Response status: {response.status}")
 
-                    return response_json
+                        try:
+                            response_json = (
+                                json.loads(response_text) if response_text else {}
+                            )
+                        except json.JSONDecodeError:
+                            logger.error(
+                                f"Invalid JSON response: {response_text[:200]}..."
+                            )
+                            response_json = {}
 
-            except aiohttp.ClientError as e:
-                logger.error(f"Network error: {str(e)}")
-                raise Exception(f"Network error accessing {url}: {str(e)}")
+                        if response.status >= 400:
+                            error_msg = self._format_error_message(
+                                response.status, response_text
+                            )
+                            if (
+                                response.status in _RETRYABLE_STATUSES
+                                and attempt < _MAX_RETRIES
+                            ):
+                                logger.warning(
+                                    f"Transient error {response.status} on attempt "
+                                    f"{attempt + 1}/{_MAX_RETRIES + 1}, will retry"
+                                )
+                                last_exc = Exception(error_msg)
+                            else:
+                                raise Exception(error_msg)
+                        else:
+                            return response_json
+
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    logger.warning(
+                        f"Network error on attempt {attempt + 1}/{_MAX_RETRIES + 1}: "
+                        f"{str(e)}"
+                    )
+                    last_exc = Exception(f"Network error accessing {url}: {str(e)}")
+
+        raise last_exc
 
     def _format_error_message(self, status: int, response_text: str) -> str:
         """Format error message based on HTTP status code"""
