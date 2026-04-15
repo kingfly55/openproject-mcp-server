@@ -1,5 +1,5 @@
 """
-Shared pytest configuration and fixtures.
+Shared pytest configuration and fixtures for all test modules.
 
 Sets dummy environment variables BEFORE any src.server import so
 OpenProjectClient initialises without hitting a real API.
