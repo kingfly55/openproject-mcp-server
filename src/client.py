@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 # Version information
 __version__ = "2.0.0"
 
+# HTTP methods that modify data — blocked when readonly=True
+_WRITE_METHODS = frozenset({"POST", "PATCH", "PUT", "DELETE"})
 # Retry configuration
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 1.0  # seconds (doubled on each attempt: 1s, 2s, 4s)
@@ -30,7 +32,13 @@ _RETRYABLE_STATUSES = {500, 502, 503, 504}
 class OpenProjectClient:
     """Client for the OpenProject API v3 with optional proxy support"""
 
-    def __init__(self, base_url: str, api_key: str, proxy: Optional[str] = None):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        proxy: Optional[str] = None,
+        readonly: bool = False,
+    ):
         """
         Initialize the OpenProject client.
 
@@ -38,10 +46,12 @@ class OpenProjectClient:
             base_url: The base URL of the OpenProject instance
             api_key: API key for authentication
             proxy: Optional HTTP proxy URL
+            readonly: If True, POST/PATCH/PUT/DELETE requests are blocked
         """
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.proxy = proxy
+        self.readonly = readonly
 
         # Setup headers with Basic Auth
         self.headers = {
@@ -54,6 +64,8 @@ class OpenProjectClient:
         logger.info(f"OpenProject Client initialized for: {self.base_url}")
         if self.proxy:
             logger.info(f"Using proxy: {self.proxy}")
+        if self.readonly:
+            logger.info("Read-only mode ENABLED: write requests will be blocked")
 
     def _encode_api_key(self) -> str:
         """Encode API key for Basic Auth"""
@@ -80,6 +92,12 @@ class OpenProjectClient:
         Raises:
             Exception: If the request fails after all retry attempts
         """
+        if self.readonly and method.upper() in _WRITE_METHODS:
+            raise Exception(
+                f"Read-only mode is enabled: {method.upper()} operations are not "
+                "permitted. Set READ_ONLY_MODE=false to allow write operations."
+            )
+
         url = f"{self.base_url}/api/v3{endpoint}"
 
         logger.debug(f"API Request: {method} {url}")
